@@ -11,7 +11,8 @@ use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
 use async_trait::async_trait;
 use extension::{
-    ExtensionLanguageServerProxy, KeyValueStoreDelegate, ProjectDelegate, WorktreeDelegate,
+    ExtensionEditorProxy, ExtensionLanguageServerProxy, KeyValueStoreDelegate, ProjectDelegate,
+    WorktreeDelegate,
 };
 use futures::{AsyncReadExt, lock::Mutex};
 use futures::{FutureExt as _, io::BufReader};
@@ -1159,5 +1160,21 @@ impl ExtensionImports for WasmState {
             .await
             .with_context(|| format!("setting permissions for path {path:?}"))
             .to_wasmtime_result()
+    }
+
+    async fn current_selection(&mut self) -> wasmtime::Result<Option<self::SelectionData>> {
+        let proxy = self.host.proxy.clone();
+        let selection = self
+            .on_main_thread(move |cx| {
+                let task = proxy.current_selection(cx);
+                async move { task.await }.boxed_local()
+            })
+            .await;
+        Ok(selection.map(|s| self::SelectionData {
+            file_path: s.file_path,
+            start_line: s.start_line,
+            end_line: s.end_line,
+            text: s.text,
+        }))
     }
 }

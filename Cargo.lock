@@ -22999,6 +22999,7 @@ dependencies = [
  "telemetry_events",
  "tempfile",
  "terminal_view",
+ "text",
  "theme",
  "theme_extension",
  "theme_selector",

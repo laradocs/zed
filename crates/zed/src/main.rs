@@ -37,6 +37,7 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
+use language::LocalFile;
 use onboarding::{FIRST_OPEN, show_onboarding_view};
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
@@ -196,6 +197,125 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
         .detach();
     }
 }
+/// Live Zed → Claude Code selection bridge (fork addition).
+///
+/// Polls the active editor every 200ms and, when the selection changes,
+/// rewrites `~/.claude-code/state.json`. The claude-code MCP server already
+/// watches that file and pushes a `selection_changed` notification over its SSE
+/// channel, so Claude Code renders "Selected X lines" live — matching the
+/// JetBrains plugin — instead of only after a manual sync task.
+///
+/// ponytail: single-window global poller, correct for the active window only.
+/// Multiple Zed windows would need an is-active guard; add if you run 2+ windows.
+#[derive(serde::Serialize)]
+struct ClaudeSelectionSnapshot {
+    #[serde(rename = "filePath")]
+    file_path: String,
+    #[serde(rename = "startLine")]
+    start_line: u32,
+    #[serde(rename = "endLine")]
+    end_line: u32,
+    text: String,
+}
+
+fn claude_selection_state_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home)
+        .join(".claude-code")
+        .join("state.json")
+}
+
+fn claude_read_editor(
+    editor: &mut Editor,
+    cx: &mut gpui::App,
+) -> Option<ClaudeSelectionSnapshot> {
+    // File path from the singleton buffer (multi-file buffers report None).
+    let singleton = editor.buffer().read(cx).as_singleton();
+    let file_path = singleton
+        .as_ref()
+        .and_then(|buffer| project::File::from_dyn(buffer.read(cx).file()))
+        .map(|file| file.abs_path(cx))?;
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let selection = editor.selections.newest_anchor();
+    let start_line = snapshot
+        .summary_for_anchor::<text::Point>(&selection.start)
+        .row as u32
+        + 1;
+    let end_line = snapshot
+        .summary_for_anchor::<text::Point>(&selection.end)
+        .row as u32
+        + 1;
+    let text: String = snapshot
+        .text_for_range(selection.start..selection.end)
+        .collect();
+
+    Some(ClaudeSelectionSnapshot {
+        file_path: file_path.to_string_lossy().into_owned(),
+        start_line,
+        end_line,
+        text,
+    })
+}
+
+fn claude_snapshot_selection(
+    window: &gpui::WindowHandle<MultiWorkspace>,
+    cx: &mut gpui::AsyncApp,
+) -> Option<ClaudeSelectionSnapshot> {
+    window
+        .update(cx, |multi_workspace, _window, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            let editor = workspace.read(cx).active_item_as::<Editor>(cx)?;
+            editor.update(cx, |editor, cx| claude_read_editor(editor, cx))
+        })
+        .ok()
+        .flatten()
+}
+
+fn spawn_claude_selection_sync(cx: &mut gpui::App) {
+    cx.spawn(async move |cx| {
+        let mut last = String::new();
+        loop {
+            let window = cx.update(|cx| {
+                cx.active_window()
+                    .and_then(|window| window.downcast::<MultiWorkspace>())
+            });
+            let snapshot = window.and_then(|window| claude_snapshot_selection(&window, cx));
+            if let Some(snapshot) = snapshot
+                && let Ok(encoded) = serde_json::to_string(&snapshot)
+                && encoded != last
+            {
+                last = encoded.clone();
+                let _ = std::fs::write(claude_selection_state_path(), &encoded);
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(200))
+                .await;
+        }
+    })
+    .detach();
+}
+
+/// Exposes the active editor's selection to extensions via the
+/// `current-selection` host function (Zed's job is only the readable API; the
+/// plugin owns everything it does with the selection). Reuses the same
+/// active-editor reader as the selection poller below.
+struct ZedEditorProxy;
+
+impl extension::ExtensionEditorProxy for ZedEditorProxy {
+    fn current_selection(&self, cx: &mut gpui::AsyncApp) -> gpui::Task<Option<extension::ZedSelectionData>> {
+        let selection = cx
+            .update(|cx| cx.active_window().and_then(|w| w.downcast::<MultiWorkspace>()))
+            .and_then(|window| claude_snapshot_selection(&window, cx));
+        gpui::Task::ready(selection.map(|s| extension::ZedSelectionData {
+            file_path: s.file_path,
+            start_line: s.start_line,
+            end_line: s.end_line,
+            text: s.text,
+        }))
+    }
+}
+
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
@@ -523,6 +643,8 @@ fn main() {
 
         extension::init(cx);
         let extension_host_proxy = ExtensionHostProxy::global(cx);
+        // Expose active-editor selection to extensions (current-selection host fn).
+        extension_host_proxy.register_editor_proxy(ZedEditorProxy);
 
         let client = Client::production(cx);
         cx.set_http_client(client.http_client());
@@ -978,6 +1100,11 @@ fn main() {
             }
         })
         .detach_and_log_err(cx);
+
+        // Live selection bridge to Claude Code: mirror the active editor's
+        // selection into ~/.claude-code/state.json so the CLI shows "Selected
+        // N lines" the moment the user selects (JetBrains-plugin parity).
+        spawn_claude_selection_sync(cx);
 
         let app_state = app_state.clone();
 
