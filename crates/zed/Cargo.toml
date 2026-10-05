@@ -214,6 +214,7 @@ theme_settings.workspace = true
 time.workspace = true
 time_format.workspace = true
 title_bar.workspace = true
+task.workspace = true
 toolchain_selector.workspace = true
 tracing.workspace = true
 text.workspace = true

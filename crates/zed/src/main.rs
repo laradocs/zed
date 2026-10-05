@@ -286,7 +286,11 @@ fn spawn_claude_selection_sync(cx: &mut gpui::App) {
                 && encoded != last
             {
                 last = encoded.clone();
-                let _ = std::fs::write(claude_selection_state_path(), &encoded);
+                let state_path = claude_selection_state_path();
+                if let Some(parent) = state_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let _ = std::fs::write(&state_path, &encoded);
             }
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(200))
