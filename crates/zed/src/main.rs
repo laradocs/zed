@@ -4,6 +4,7 @@
 mod reliability;
 mod watcher_debug;
 mod zed;
+mod ide;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
 // at runtime (data dir, config dir, etc.) match what the binary is called.
@@ -197,16 +198,11 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
         .detach();
     }
 }
-/// Live Zed → Claude Code selection bridge (fork addition).
+/// Active-editor selection reader (fork addition).
 ///
-/// Polls the active editor every 200ms and, when the selection changes,
-/// rewrites `~/.claude-code/state.json`. The claude-code MCP server already
-/// watches that file and pushes a `selection_changed` notification over its SSE
-/// channel, so Claude Code renders "Selected X lines" live — matching the
-/// JetBrains plugin — instead of only after a manual sync task.
-///
-/// ponytail: single-window global poller, correct for the active window only.
-/// Multiple Zed windows would need an is-active guard; add if you run 2+ windows.
+/// Reads the active editor's file/cursor/selection in-process. Consumed by the
+/// in-process IDE bridge (`ide` module) and the `current-selection` extension
+/// API — no file polling, no state.json.
 #[derive(serde::Serialize)]
 struct ClaudeSelectionSnapshot {
     #[serde(rename = "filePath")]
@@ -216,13 +212,6 @@ struct ClaudeSelectionSnapshot {
     #[serde(rename = "endLine")]
     end_line: u32,
     text: String,
-}
-
-fn claude_selection_state_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home)
-        .join(".claude-code")
-        .join("state.json")
 }
 
 fn claude_read_editor(
@@ -272,38 +261,10 @@ fn claude_snapshot_selection(
         .flatten()
 }
 
-fn spawn_claude_selection_sync(cx: &mut gpui::App) {
-    cx.spawn(async move |cx| {
-        let mut last = String::new();
-        loop {
-            let window = cx.update(|cx| {
-                cx.active_window()
-                    .and_then(|window| window.downcast::<MultiWorkspace>())
-            });
-            let snapshot = window.and_then(|window| claude_snapshot_selection(&window, cx));
-            if let Some(snapshot) = snapshot
-                && let Ok(encoded) = serde_json::to_string(&snapshot)
-                && encoded != last
-            {
-                last = encoded.clone();
-                let state_path = claude_selection_state_path();
-                if let Some(parent) = state_path.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                let _ = std::fs::write(&state_path, &encoded);
-            }
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(200))
-                .await;
-        }
-    })
-    .detach();
-}
-
 /// Exposes the active editor's selection to extensions via the
 /// `current-selection` host function (Zed's job is only the readable API; the
-/// plugin owns everything it does with the selection). Reuses the same
-/// active-editor reader as the selection poller below.
+/// plugin owns everything it does with the selection). Reuses the active-editor
+/// reader shared with the in-process ide bridge.
 struct ZedEditorProxy;
 
 impl extension::ExtensionEditorProxy for ZedEditorProxy {
@@ -1105,10 +1066,10 @@ fn main() {
         })
         .detach_and_log_err(cx);
 
-        // Live selection bridge to Claude Code: mirror the active editor's
-        // selection into ~/.claude-code/state.json so the CLI shows "Selected
-        // N lines" the moment the user selects (JetBrains-plugin parity).
-        spawn_claude_selection_sync(cx);
+        // In-process IDE bridge (WebSocket MCP server). Each Zed process owns
+        // its own port + lockfile, so multiple windows pair 1:1 with a coding
+        // agent — no shared state.json, no collision.
+        ide::init(cx);
 
         let app_state = app_state.clone();
 
