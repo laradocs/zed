@@ -12,7 +12,7 @@
 //! thread over a `Send` channel and answered via a oneshot (the acp.rs idiom).
 
 use futures_util::{SinkExt, StreamExt};
-use gpui::AsyncApp;
+use gpui::{AsyncApp, WindowHandle};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,20 +35,25 @@ type Conns = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>>;
 
 static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Start the in-process WS server. Called once at app startup.
-pub fn init(cx: &mut gpui::App) {
+/// Start an IDE server bound to ONE window. Called once per Zed window so N
+/// windows each get their own port + lockfile and pair 1:1 with an agent.
+pub fn spawn_window_instance(
+    window: WindowHandle<MultiWorkspace>,
+    cx: &mut gpui::Context<MultiWorkspace>,
+) {
     let (req_tx, req_rx) = async_channel::unbounded::<(EditorRequest, RespTx)>();
     let (sel_tx, sel_rx) = async_channel::unbounded::<Value>();
 
-    // [gpui main thread] owns AsyncApp: services editor requests + pushes the
-    // live selection. Replaces the state.json poller.
-    cx.spawn(async move |cx: &mut AsyncApp| {
+    // [gpui main thread] reader bound to THIS window: services editor requests
+    // + pushes this window's live selection (not the global active window).
+    let reader_window = window.clone();
+    cx.spawn(async move |_mw, cx: &mut AsyncApp| {
         let mut last = String::new();
         loop {
             while let Ok((req, resp_tx)) = req_rx.try_recv() {
-                let _ = resp_tx.send(run_request(req, cx));
+                let _ = resp_tx.send(run_request(req, &reader_window, cx));
             }
-            if let Some(notif) = build_selection_changed(cx) {
+            if let Some(notif) = build_selection_changed(&reader_window, cx) {
                 let encoded = serde_json::to_string(&notif).unwrap_or_default();
                 if encoded != last {
                     last = encoded;
@@ -62,9 +67,20 @@ pub fn init(cx: &mut gpui::App) {
     })
     .detach();
 
-    // [tokio] WS server — Send only; app state reached via the channels above.
-    let handle = gpui_tokio::Tokio::handle(cx);
-    handle.spawn(run(req_tx, sel_rx));
+    // [tokio] WS server on its own single-threaded runtime (one per window).
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[ide] tokio runtime failed: {e}");
+                return;
+            }
+        };
+        rt.block_on(run(req_tx, sel_rx));
+    });
 }
 
 async fn run(req_tx: ReqTx, sel_rx: async_channel::Receiver<Value>) {
@@ -95,7 +111,12 @@ async fn run(req_tx: ReqTx, sel_rx: async_channel::Receiver<Value>) {
             let mut last_folders: Option<Vec<String>> = None;
             loop {
                 let folders = request_workspace_folders(&refresh_tx).await;
-                if last_folders.as_ref() != Some(&folders) || !lock_path(port).exists() {
+                if folders.is_empty() {
+                    // No project open (welcome/transient window) — not an IDE
+                    // target, so stay undiscoverable: never publish a lockfile.
+                    std::fs::remove_file(lock_path(port)).ok();
+                    last_folders = Some(folders);
+                } else if last_folders.as_ref() != Some(&folders) || !lock_path(port).exists() {
                     last_folders = Some(folders.clone());
                     write_lock_file(port, &folders);
                 }
@@ -253,10 +274,10 @@ fn tool_error(id: Value, text: impl Into<String>) -> Value {
 
 // -- main-thread (gpui) side: all app-state reads live here ----------------
 
-fn run_request(req: EditorRequest, cx: &mut AsyncApp) -> Value {
+fn run_request(req: EditorRequest, window: &WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) -> Value {
     match req {
-        EditorRequest::Snapshot => read_selection(cx),
-        EditorRequest::WorkspaceFolders => workspace_folders(cx),
+        EditorRequest::Snapshot => read_selection(window, cx),
+        EditorRequest::WorkspaceFolders => workspace_folders(window, cx),
     }
 }
 
@@ -272,31 +293,25 @@ async fn request_workspace_folders(req_tx: &ReqTx) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn workspace_folders(cx: &mut AsyncApp) -> Value {
-    let folders = cx
-        .update(|cx| cx.active_window().and_then(|w| w.downcast::<MultiWorkspace>()))
-        .and_then(|window| {
-            window
-                .update(cx, |multi_workspace, _window, cx| {
-                    let workspace = multi_workspace.workspace().clone();
-                    let folders: Vec<String> = workspace
-                        .read(cx)
-                        .worktrees(cx)
-                        .map(|wt| wt.read(cx).abs_path().to_string_lossy().into_owned())
-                        .collect();
-                    Some(folders)
-                })
-                .ok()
-                .flatten()
+fn workspace_folders(window: &WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) -> Value {
+    let folders = window
+        .update(cx, |multi_workspace, _window, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            let folders: Vec<String> = workspace
+                .read(cx)
+                .worktrees(cx)
+                .map(|wt| wt.read(cx).abs_path().to_string_lossy().into_owned())
+                .collect();
+            Some(folders)
         })
+        .ok()
+        .flatten()
         .unwrap_or_default();
     json!(folders)
 }
 
-fn read_selection(cx: &mut AsyncApp) -> Value {
-    let snap = cx
-        .update(|cx| cx.active_window().and_then(|w| w.downcast::<MultiWorkspace>()))
-        .and_then(|window| crate::claude_snapshot_selection(&window, cx));
+fn read_selection(window: &WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) -> Value {
+    let snap = crate::claude_snapshot_selection(window, cx);
     serde_json::to_value(&snap).unwrap_or_else(|_| json!({}))
 }
 
@@ -318,8 +333,8 @@ fn editor_context_text(snap: Value) -> String {
     out
 }
 
-fn build_selection_changed(cx: &mut AsyncApp) -> Option<Value> {
-    let snap = read_selection(cx);
+fn build_selection_changed(window: &WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) -> Option<Value> {
+    let snap = read_selection(window, cx);
     let file = snap.get("filePath").and_then(|v| v.as_str()).unwrap_or("");
     if file.is_empty() {
         return Some(json!({
@@ -358,6 +373,69 @@ fn lock_path(port: u16) -> std::path::PathBuf {
         .join(".claude")
         .join("ide")
         .join(format!("{port}.lock"))
+}
+
+/// Iterate every `*.lock` as `(path, pid)`, skipping malformed ones.
+fn each_lock_pid(mut f: impl FnMut(std::path::PathBuf, u64)) {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".claude").join("ide");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lock") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(pid) = serde_json::from_str::<Value>(&content)
+            .ok()
+            .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        else {
+            continue; // malformed lock — leave it, don't guess
+        };
+        f(path, pid);
+    }
+}
+
+/// Remove lockfiles left by DEAD processes (previous Zed sessions each used a
+/// different dynamic port). Runs once at startup so `~/.claude/ide/` doesn't
+/// accumulate stale entries forever.
+pub fn cleanup_stale_locks() {
+    let my_pid = std::process::id() as u64;
+    each_lock_pid(|path, pid| {
+        if pid != my_pid && !pid_alive(pid as u32) {
+            std::fs::remove_file(&path).ok();
+        }
+    });
+}
+
+/// Remove all lockfiles THIS process wrote (pid == ours). Called on app quit so
+/// a clean Dock quit doesn't leave phantom Zed entries in Claude's /ide.
+pub fn remove_my_lockfiles() {
+    let my_pid = std::process::id() as u64;
+    each_lock_pid(|path, pid| {
+        if pid == my_pid {
+            std::fs::remove_file(&path).ok();
+        }
+    });
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) with sig 0: returns 0 → alive; -1 with ESRCH → dead; any
+    // other errno (e.g. EPERM) → the process exists but we lack perms → alive.
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true // conservative off-unix: never treat a lock as stale
 }
 
 /// Write this process's IDE lockfile so Claude Code discovers us via the port.

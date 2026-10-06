@@ -1066,10 +1066,28 @@ fn main() {
         })
         .detach_and_log_err(cx);
 
-        // In-process IDE bridge (WebSocket MCP server). Each Zed process owns
-        // its own port + lockfile, so multiple windows pair 1:1 with a coding
-        // agent — no shared state.json, no collision.
-        ide::init(cx);
+        // Per-window IDE bridge (WebSocket MCP server). Each Zed window gets its
+        // own server (dynamic port + lockfile + reads only that window), so N
+        // windows pair 1:1 with agent sessions — no shared state.json, no
+        // cross-window selection bleed. Stale locks from dead previous sessions
+        // are swept once at startup so ~/.claude/ide/ doesn't grow unbounded.
+        ide::cleanup_stale_locks();
+        cx.observe_new::<MultiWorkspace>(move |_multi_workspace, window, cx| {
+            if let Some(window) =
+                window.and_then(|w| w.window_handle().downcast::<MultiWorkspace>())
+            {
+                ide::spawn_window_instance(window, cx);
+            }
+        })
+        .detach();
+
+        // On clean quit, remove our own lockfiles so Claude's /ide doesn't list
+        // a phantom Zed after Zed is gone.
+        cx.on_app_quit(|_cx| {
+            ide::remove_my_lockfiles();
+            async {}
+        })
+        .detach();
 
         let app_state = app_state.clone();
 

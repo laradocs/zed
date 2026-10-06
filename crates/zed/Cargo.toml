@@ -132,6 +132,7 @@ tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time"] 
 async-channel = "2"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+libc.workspace = true
 hdrhistogram.workspace = true
 image = { workspace = true, optional = true }
 spin = "0.10.0"
