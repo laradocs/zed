@@ -11,8 +11,12 @@
 //! never touches app state; every editor read is marshalled to the gpui main
 //! thread over a `Send` channel and answered via a oneshot (the acp.rs idiom).
 
+use buffer_diff::BufferDiff;
+use editor::Editor;
 use futures_util::{SinkExt, StreamExt};
-use gpui::{AsyncApp, WindowHandle};
+use gpui::{App, AppContext, AsyncApp, WindowHandle};
+use language::{Buffer, Capability};
+use multi_buffer::MultiBuffer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +31,7 @@ use workspace::MultiWorkspace;
 enum EditorRequest {
     Snapshot,
     WorkspaceFolders,
+    OpenDiff { path: String, new_content: String },
 }
 
 type RespTx = oneshot::Sender<Value>;
@@ -231,6 +236,18 @@ async fn handle_mcp(req: &Value, req_tx: &ReqTx) -> Option<Value> {
                     "name": "getEditorContext",
                     "description": "Get the Zed editor context: the active file, cursor position, and any selected text (read live, in-process).",
                     "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "openDiff",
+                    "description": "Show the proposed change to a file as a diff in Zed (the current file vs the proposed content) for review.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "old_file_path": { "type": "string", "description": "Absolute path of the current file." },
+                            "new_file_contents": { "type": "string", "description": "The proposed new file contents." }
+                        },
+                        "required": ["old_file_path", "new_file_contents"]
+                    }
                 }
             ] }
         })),
@@ -241,11 +258,25 @@ async fn handle_mcp(req: &Value, req_tx: &ReqTx) -> Option<Value> {
                     let snap = request_snapshot(req_tx).await;
                     Some(tool_text(id, editor_context_text(snap)))
                 }
+                "openDiff" => {
+                    let path = req["params"]["arguments"]["old_file_path"].as_str().unwrap_or("").to_string();
+                    let new_content = req["params"]["arguments"]["new_file_contents"].as_str().unwrap_or("").to_string();
+                    let _ = request_open_diff(req_tx, path, new_content).await;
+                    Some(tool_text(id, "Opened the diff in Zed for review."))
+                }
                 _ => Some(tool_error(id, format!("tool {name}: not available in M1 spike"))),
             }
         }
         _ => None,
     }
+}
+
+async fn request_open_diff(req_tx: &ReqTx, path: String, new_content: String) -> Value {
+    let (resp_tx, resp_rx) = oneshot::channel::<Value>();
+    if req_tx.send((EditorRequest::OpenDiff { path, new_content }, resp_tx)).await.is_err() {
+        return json!({});
+    }
+    resp_rx.await.unwrap_or_else(|_| json!({}))
 }
 
 async fn request_snapshot(req_tx: &ReqTx) -> Value {
@@ -278,6 +309,66 @@ fn run_request(req: EditorRequest, window: &WindowHandle<MultiWorkspace>, cx: &m
     match req {
         EditorRequest::Snapshot => read_selection(window, cx),
         EditorRequest::WorkspaceFolders => workspace_folders(window, cx),
+        EditorRequest::OpenDiff { path, new_content } => {
+            open_diff_view(&path, new_content, window, cx)
+        }
+    }
+}
+
+/// Open a read-only diff view: the current file at `path` vs `new_content`
+/// (Claude's proposed change). Shows the comparison in a dedicated editor tab;
+/// does NOT modify the file on disk.
+fn open_diff_view(
+    path: &str,
+    new_content: String,
+    window: &WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) -> Value {
+    let old_content = std::fs::read_to_string(path).unwrap_or_default();
+    let title = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Diff".to_string());
+
+    // Entity creation and `add_item_to_active_pane` need (&mut Window, &mut App).
+    // `WindowHandle::update` runs the closure on this window's main thread with a
+    // `Context<MultiWorkspace>` that derefs to `App` — so `cx.new` (AppContext) and
+    // the `&mut App` coercion both resolve. Shows old vs proposed content; the file
+    // on disk is untouched and there is nothing to accept or reject.
+    let opened = window.update(cx, |multi_workspace, window, cx| {
+        let cx: &mut App = cx;
+        let workspace = multi_workspace.workspace().clone();
+        let project = workspace.read(cx).project().clone();
+
+        // "new" side = proposed content; base = current file, so the diff hunks
+        // show exactly what the proposal changes. The file itself is not written.
+        let new_buffer = cx.new(|cx| Buffer::local(new_content, cx));
+        let new_snapshot = new_buffer.read(cx).snapshot();
+        let base_buffer = cx.new(|cx| {
+            let mut b = Buffer::local(old_content, cx);
+            b.set_capability(Capability::ReadOnly, cx);
+            b
+        });
+        let diff_val = BufferDiff::new_with_base_text_buffer(&new_snapshot, base_buffer, cx);
+        let diff = cx.new(|_| diff_val);
+        let multibuffer =
+            cx.new(|cx| MultiBuffer::singleton(new_buffer, cx).with_title(title.clone()));
+        multibuffer.update(cx, |multibuffer, cx| multibuffer.add_diff(diff, cx));
+
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(multibuffer, Some(project), window, cx);
+            editor.set_breadcrumb_header(title.clone());
+            editor
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+        });
+    });
+
+    match opened {
+        Ok(()) => json!({ "ok": true, "message": "opened diff" }),
+        Err(_) => json!({ "ok": false, "message": "window unavailable" }),
     }
 }
 
