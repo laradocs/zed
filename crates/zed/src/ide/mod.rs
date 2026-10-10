@@ -12,11 +12,10 @@
 //! thread over a `Send` channel and answered via a oneshot (the acp.rs idiom).
 
 use buffer_diff::BufferDiff;
-use editor::Editor;
 use futures_util::{SinkExt, StreamExt};
+use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{App, AppContext, AsyncApp, WindowHandle};
 use language::{Buffer, Capability};
-use multi_buffer::MultiBuffer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +30,8 @@ use workspace::MultiWorkspace;
 enum EditorRequest {
     Snapshot,
     WorkspaceFolders,
-    OpenDiff { path: String, new_content: String },
+    OpenDiff { path: String, old_str: String, new_str: String },
+    CloseAllDiffTabs,
 }
 
 type RespTx = oneshot::Sender<Value>;
@@ -56,7 +56,21 @@ pub fn spawn_window_instance(
         let mut last = String::new();
         loop {
             while let Ok((req, resp_tx)) = req_rx.try_recv() {
-                let _ = resp_tx.send(run_request(req, &reader_window, cx));
+                match req {
+                    // openDiff must await diff-hunk computation, so it runs in its
+                    // own task; snapshot/folders stay synchronous.
+                    EditorRequest::OpenDiff { path, old_str, new_str } => {
+                        let window = reader_window.clone();
+                        cx.spawn(async move |cx: &mut AsyncApp| {
+                            let result = open_diff_async(path, old_str, new_str, &window, cx).await;
+                            let _ = resp_tx.send(result);
+                        })
+                        .detach();
+                    }
+                    other => {
+                        let _ = resp_tx.send(run_request(other, &reader_window, cx));
+                    }
+                }
             }
             if let Some(notif) = build_selection_changed(&reader_window, cx) {
                 let encoded = serde_json::to_string(&notif).unwrap_or_default();
@@ -199,6 +213,8 @@ async fn handle_conn(stream: tokio::net::TcpStream, conns: Conns, req_tx: ReqTx)
                     let tool = rpc["params"]["name"].as_str().unwrap_or("");
                     eprintln!("[ide] -> method={method} tool={tool}");
                     if let Some(resp) = handle_mcp(&rpc, &req_tx).await {
+                        let is_error = resp["result"]["isError"].as_bool().unwrap_or(false);
+                        eprintln!("[ide] <- method={method} is_error={is_error}");
                         let _ = out_tx.send(serde_json::to_string(&resp).unwrap_or_default());
                     }
                 }
@@ -238,15 +254,26 @@ async fn handle_mcp(req: &Value, req_tx: &ReqTx) -> Option<Value> {
                     "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
+                    "name": "executeCode",
+                    "description": "Compatibility alias for getEditorContext used by Claude Code's IDE handshake.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "closeAllDiffTabs",
+                    "description": "Close all diff tabs opened through the IDE channel.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
                     "name": "openDiff",
-                    "description": "Show the proposed change to a file as a diff in Zed (the current file vs the proposed content) for review.",
+                    "description": "Show a proposed change to a file as a read-only diff (the file's current buffer vs the proposed content). Claude passes old_str/new_str exactly as it would for an Edit; Zed reads the current buffer, applies the replacement in memory, and shows the diff. The file on disk is NOT written.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "old_file_path": { "type": "string", "description": "Absolute path of the current file." },
-                            "new_file_contents": { "type": "string", "description": "The proposed new file contents." }
+                            "path": { "type": "string", "description": "Absolute path of the file." },
+                            "old_str": { "type": "string", "description": "The exact text to be replaced (as in an Edit)." },
+                            "new_str": { "type": "string", "description": "The replacement text (as in an Edit)." }
                         },
-                        "required": ["old_file_path", "new_file_contents"]
+                        "required": ["path", "old_str", "new_str"]
                     }
                 }
             ] }
@@ -258,25 +285,24 @@ async fn handle_mcp(req: &Value, req_tx: &ReqTx) -> Option<Value> {
                     let snap = request_snapshot(req_tx).await;
                     Some(tool_text(id, editor_context_text(snap)))
                 }
-                "openDiff" => {
-                    let path = req["params"]["arguments"]["old_file_path"].as_str().unwrap_or("").to_string();
-                    let new_content = req["params"]["arguments"]["new_file_contents"].as_str().unwrap_or("").to_string();
-                    let _ = request_open_diff(req_tx, path, new_content).await;
-                    Some(tool_text(id, "Opened the diff in Zed for review."))
+                "executeCode" => {
+                    let snap = request_snapshot(req_tx).await;
+                    Some(tool_text(id, editor_context_text(snap)))
                 }
+                "openDiff" => {
+                    let path = req["params"]["arguments"]["path"].as_str().unwrap_or("").to_string();
+                    let old_str = req["params"]["arguments"]["old_str"].as_str().unwrap_or("").to_string();
+                    let new_str = req["params"]["arguments"]["new_str"].as_str().unwrap_or("").to_string();
+                    Some(request_open_diff(req_tx, id, path, old_str, new_str).await)
+                }
+                "closeAllDiffTabs" => Some(request_close_diff_tabs(req_tx, id).await),
+                "close_tab" => Some(tool_text(id, "TAB_CLOSED")),
+                "getDiagnostics" => Some(tool_text(id, "[]")),
                 _ => Some(tool_error(id, format!("tool {name}: not available in M1 spike"))),
             }
         }
         _ => None,
     }
-}
-
-async fn request_open_diff(req_tx: &ReqTx, path: String, new_content: String) -> Value {
-    let (resp_tx, resp_rx) = oneshot::channel::<Value>();
-    if req_tx.send((EditorRequest::OpenDiff { path, new_content }, resp_tx)).await.is_err() {
-        return json!({});
-    }
-    resp_rx.await.unwrap_or_else(|_| json!({}))
 }
 
 async fn request_snapshot(req_tx: &ReqTx) -> Value {
@@ -285,6 +311,62 @@ async fn request_snapshot(req_tx: &ReqTx) -> Value {
         return json!({});
     }
     resp_rx.await.unwrap_or_else(|_| json!({}))
+}
+
+async fn request_open_diff(
+    req_tx: &ReqTx,
+    id: Value,
+    path: String,
+    old_str: String,
+    new_str: String,
+) -> Value {
+    let (resp_tx, resp_rx) = oneshot::channel::<Value>();
+    if req_tx
+        .send((EditorRequest::OpenDiff { path, old_str, new_str }, resp_tx))
+        .await
+        .is_err()
+    {
+        return tool_error(id, "editor channel closed".to_string());
+    }
+    match resp_rx.await {
+        Ok(result) => {
+            let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let msg = result.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if ok {
+                tool_text(id, msg)
+            } else {
+                tool_error(id, msg)
+            }
+        }
+        Err(_) => tool_error(id, "editor did not respond".to_string()),
+    }
+}
+
+async fn request_close_diff_tabs(req_tx: &ReqTx, id: Value) -> Value {
+    let (resp_tx, resp_rx) = oneshot::channel::<Value>();
+    if req_tx
+        .send((EditorRequest::CloseAllDiffTabs, resp_tx))
+        .await
+        .is_err()
+    {
+        return tool_error(id, "editor channel closed".to_string());
+    }
+    match resp_rx.await {
+        Ok(result) => {
+            let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+            let msg = result
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if ok {
+                tool_text(id, msg)
+            } else {
+                tool_error(id, msg)
+            }
+        }
+        Err(_) => tool_error(id, "editor did not respond".to_string()),
+    }
 }
 
 fn tool_text(id: Value, text: impl Into<String>) -> Value {
@@ -309,67 +391,175 @@ fn run_request(req: EditorRequest, window: &WindowHandle<MultiWorkspace>, cx: &m
     match req {
         EditorRequest::Snapshot => read_selection(window, cx),
         EditorRequest::WorkspaceFolders => workspace_folders(window, cx),
-        EditorRequest::OpenDiff { path, new_content } => {
-            open_diff_view(&path, new_content, window, cx)
-        }
+        // OpenDiff is handled asynchronously in the reader loop (it awaits diff
+        // computation); this arm is only reached if dispatched synchronously.
+        EditorRequest::OpenDiff { .. } => json!({ "ok": false, "message": "handled via async path" }),
+        EditorRequest::CloseAllDiffTabs => close_diff_tabs(window, cx),
     }
 }
 
-/// Open a read-only diff view: the current file at `path` vs `new_content`
-/// (Claude's proposed change). Shows the comparison in a dedicated editor tab;
-/// does NOT modify the file on disk.
-fn open_diff_view(
-    path: &str,
-    new_content: String,
+/// Open a read-only, side-by-side diff (left = committed version, right = the
+/// file's current buffer). Claude Code writes the file itself, then calls this
+/// to preview — so by the time we run, the buffer already holds the NEW text.
+/// The OLD text therefore comes from git HEAD (the pre-edit version), and no
+/// content needs to be passed in at all (zero tokens). Nothing is written.
+///
+/// Async because computing the diff hunks (`BufferDiff::update_diff`) is async.
+async fn open_diff_async(
+    path: String,
+    old_str: String,
+    new_str: String,
     window: &WindowHandle<MultiWorkspace>,
     cx: &mut AsyncApp,
 ) -> Value {
-    let old_content = std::fs::read_to_string(path).unwrap_or_default();
-    let title = std::path::Path::new(path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Diff".to_string());
+    // Old content comes from git HEAD; the args are unused.
+    let _ = (old_str, new_str);
+    let abs = std::path::PathBuf::from(&path);
 
-    // Entity creation and `add_item_to_active_pane` need (&mut Window, &mut App).
-    // `WindowHandle::update` runs the closure on this window's main thread with a
-    // `Context<MultiWorkspace>` that derefs to `App` — so `cx.new` (AppContext) and
-    // the `&mut App` coercion both resolve. Shows old vs proposed content; the file
-    // on disk is untouched and there is nothing to accept or reject.
-    let opened = window.update(cx, |multi_workspace, window, cx| {
+    // left = the pre-edit version from git HEAD. If the file isn't in git (or has
+    // no committed version) there is nothing to compare, so don't open a diff.
+    let Some(old_content) = git_head_content(&abs) else {
+        return json!({ "ok": false, "message": "file not in git; nothing to compare" });
+    };
+
+    // right = the real file buffer via open_local_buffer: it carries the file
+    // path (so the tab shows the name and the buffer gets syntax highlighting).
+    // It is editable, but this is a preview — we never save it, and Claude's own
+    // write path owns the real edit.
+    let new_buffer_task = window.update(cx, |multi_workspace, _window, cx| {
         let cx: &mut App = cx;
-        let workspace = multi_workspace.workspace().clone();
-        let project = workspace.read(cx).project().clone();
+        let project = multi_workspace.workspace().read(cx).project().clone();
+        project.update(cx, |project, cx| project.open_local_buffer(&abs, cx))
+    });
+    let new_buffer = match new_buffer_task {
+        Ok(task) => match task.await {
+            Ok(buffer) => buffer,
+            Err(e) => return json!({ "ok": false, "message": format!("failed to open file: {e}") }),
+        },
+        Err(_) => return json!({ "ok": false, "message": "window unavailable" }),
+    };
 
-        // "new" side = proposed content; base = current file, so the diff hunks
-        // show exactly what the proposal changes. The file itself is not written.
-        let new_buffer = cx.new(|cx| Buffer::local(new_content, cx));
-        let new_snapshot = new_buffer.read(cx).snapshot();
-        let base_buffer = cx.new(|cx| {
+    eprintln!("[ide] openDiff path={} old_len(git)={}", path, old_content.len());
+
+    // Build the old (committed, read-only) buffer and the BufferDiff. Skip when
+    // the buffer already matches git HEAD (nothing changed) — no empty diffs.
+    let built = window.update(cx, |multi_workspace, _window, cx| {
+        let cx: &mut App = cx;
+        let project = multi_workspace.workspace().read(cx).project().clone();
+
+        if new_buffer.read(cx).text() == old_content {
+            return None;
+        }
+        let old_buffer = cx.new(|cx| {
             let mut b = Buffer::local(old_content, cx);
             b.set_capability(Capability::ReadOnly, cx);
             b
         });
-        let diff_val = BufferDiff::new_with_base_text_buffer(&new_snapshot, base_buffer, cx);
-        let diff = cx.new(|_| diff_val);
-        let multibuffer =
-            cx.new(|cx| MultiBuffer::singleton(new_buffer, cx).with_title(title.clone()));
-        multibuffer.update(cx, |multibuffer, cx| multibuffer.add_diff(diff, cx));
-
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::for_multibuffer(multibuffer, Some(project), window, cx);
-            editor.set_breadcrumb_header(title.clone());
-            editor
+        // base = old (left, committed), current = new (right, the file buffer).
+        let diff = cx.new(|cx| {
+            let mut diff = BufferDiff::new_with_base_text_buffer(
+                &new_buffer.read(cx).snapshot(),
+                old_buffer.clone(),
+                cx,
+            );
+            diff.set_operations(Arc::new(buffer_diff::RestoreDiffOperations));
+            diff
         });
+        Some((project, old_buffer, diff))
+    });
 
+    let (project, old_buffer, diff) = match built {
+        Ok(Some(t)) => t,
+        Ok(None) => return json!({ "ok": false, "message": "no changes vs git HEAD" }),
+        Err(_) => return json!({ "ok": false, "message": "window unavailable" }),
+    };
+
+    // Compute the diff hunks (async) — without this there is nothing to show.
+    let update = diff
+        .update(cx, |diff, cx| {
+            let base_snapshot = old_buffer.read(cx).snapshot();
+            let current_text = new_buffer.read(cx).snapshot().text.clone();
+            let base_text = Arc::<str>::from(base_snapshot.text());
+            diff.update_diff(current_text, &base_snapshot, Some(base_text), cx)
+        })
+        .await;
+    diff.update(cx, |diff, cx| diff.set_snapshot(update, cx));
+
+    // Render the side-by-side diff view in the active pane.
+    let opened = window.update(cx, |multi_workspace, window, cx| {
+        let cx: &mut App = cx;
+        let workspace = multi_workspace.workspace().clone();
+        let diff_view = cx.new(|cx| {
+            FileDiffView::new(
+                old_buffer.clone(),
+                new_buffer.clone(),
+                diff.clone(),
+                project.clone(),
+                workspace.clone(),
+                window,
+                cx,
+            )
+        });
         workspace.update(cx, |workspace, cx| {
-            workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+            workspace.add_item_to_active_pane(Box::new(diff_view.clone()), None, true, window, cx);
         });
     });
 
     match opened {
-        Ok(()) => json!({ "ok": true, "message": "opened diff" }),
+        Ok(()) => json!({ "ok": true, "message": "opened diff in Zed" }),
         Err(_) => json!({ "ok": false, "message": "window unavailable" }),
     }
+}
+
+/// The file's content at git HEAD (the pre-edit version), or None if the file
+/// isn't in a git repo or has no committed version (e.g. a brand-new file).
+fn git_head_content(abs: &std::path::Path) -> Option<String> {
+    let parent = abs.parent()?;
+    let root = std::process::Command::new("git")
+        .arg("-C")
+        .arg(parent)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .ok()?;
+    if !root.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(root.stdout).ok()?;
+    let root = root.trim();
+    let rel = abs.strip_prefix(root).ok()?.to_str()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("show")
+        .arg(format!("HEAD:{rel}"))
+        .output()
+        .ok()?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).ok()
+    } else {
+        None
+    }
+}
+
+/// Close every openDiff tab (FileDiffView) this window opened. Called by Claude
+/// Code's `closeAllDiffTabs` between turns so previews don't pile up.
+fn close_diff_tabs(window: &WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) -> Value {
+    let _ = window.update(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.workspace().clone();
+        let pane = workspace.read(cx).active_pane().clone();
+        pane.update(cx, |pane, cx| {
+            let ids: Vec<_> = pane
+                .items()
+                .filter(|item| item.downcast::<FileDiffView>().is_some())
+                .map(|item| item.item_id())
+                .collect();
+            for id in ids {
+                pane.remove_item(id, false, false, window, cx);
+            }
+        });
+    });
+    json!({ "ok": true, "message": "closed diff tabs" })
 }
 
 async fn request_workspace_folders(req_tx: &ReqTx) -> Vec<String> {
