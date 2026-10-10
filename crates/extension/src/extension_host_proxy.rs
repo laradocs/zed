@@ -32,6 +32,7 @@ pub struct ExtensionHostProxy {
     context_server_proxy: RwLock<Option<Arc<dyn ExtensionContextServerProxy>>>,
     debug_adapter_provider_proxy: RwLock<Option<Arc<dyn ExtensionDebugAdapterProviderProxy>>>,
     language_model_provider_proxy: RwLock<Option<Arc<dyn ExtensionLanguageModelProviderProxy>>>,
+    editor_proxy: RwLock<Option<Arc<dyn ExtensionEditorProxy>>>,
 }
 
 impl ExtensionHostProxy {
@@ -57,6 +58,7 @@ impl ExtensionHostProxy {
             context_server_proxy: RwLock::default(),
             debug_adapter_provider_proxy: RwLock::default(),
             language_model_provider_proxy: RwLock::default(),
+            editor_proxy: RwLock::default(),
         }
     }
 
@@ -97,6 +99,10 @@ impl ExtensionHostProxy {
         self.language_model_provider_proxy
             .write()
             .replace(Arc::new(proxy));
+    }
+
+    pub fn register_editor_proxy(&self, proxy: impl ExtensionEditorProxy) {
+        self.editor_proxy.write().replace(Arc::new(proxy));
     }
 }
 
@@ -476,5 +482,32 @@ impl ExtensionLanguageModelProviderProxy for ExtensionHostProxy {
         };
 
         proxy.unregister_language_model_provider(provider_id, cx)
+    }
+}
+
+/// The active editor's selection, as exposed to extensions via the
+/// `current-selection` host function. Lines are 1-based.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ZedSelectionData {
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub text: String,
+}
+
+/// A proxy for reading the active editor's selection so extensions can access
+/// the same editor context Zed feeds its own assistant. Implemented on the app
+/// side (which has workspace/editor access) and consumed by the extension host.
+pub trait ExtensionEditorProxy: Send + Sync + 'static {
+    fn current_selection(&self, cx: &mut gpui::AsyncApp) -> Task<Option<ZedSelectionData>>;
+}
+
+impl ExtensionEditorProxy for ExtensionHostProxy {
+    fn current_selection(&self, cx: &mut gpui::AsyncApp) -> Task<Option<ZedSelectionData>> {
+        let Some(proxy) = self.editor_proxy.read().clone() else {
+            return Task::ready(None);
+        };
+
+        proxy.current_selection(cx)
     }
 }

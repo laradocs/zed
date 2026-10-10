@@ -50,6 +50,20 @@ world extension {
 
     import get-settings: func(path: option<settings-location>, category: string, key: option<string>) -> result<string, string>;
 
+    /// A snapshot of the active editor's selection, provided by Zed to the
+    /// extension. Lines are 1-based, matching what AI/agent tooling expects.
+    record selection-data {
+        file-path: string,
+        start-line: u32,
+        end-line: u32,
+        text: string,
+    }
+
+    /// Returns the current editor selection (active file + 1-based line range +
+    /// selected text), or none when no editor is active. Lets extensions read
+    /// the same editor context Zed feeds its own assistant.
+    import current-selection: func() -> option<selection-data>;
+
     /// Downloads a file from the given URL and saves it to the given path within the extension's
     /// working directory.
     ///
