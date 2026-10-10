@@ -4,6 +4,7 @@
 mod reliability;
 mod watcher_debug;
 mod zed;
+mod ide;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
 // at runtime (data dir, config dir, etc.) match what the binary is called.
@@ -955,11 +956,27 @@ fn main() {
 
         let (first_window_tx, first_window_rx) = oneshot::channel::<()>();
         let first_window_tx = Rc::new(RefCell::new(Some(first_window_tx)));
-        let _first_window_subscription = cx.observe_new::<MultiWorkspace>(move |_, _, _| {
+        ide::cleanup_stale_locks();
+        let _first_window_subscription = cx.observe_new::<MultiWorkspace>(move |_, window, cx| {
             if let Some(tx) = first_window_tx.borrow_mut().take() {
                 tx.send(()).ok();
             }
+            // Per-window IDE bridge: each window gets its own WebSocket MCP
+            // server (dynamic port + lockfile), pairing 1:1 with an agent
+            // session — no cross-window selection bleed.
+            if let Some(window) = window.and_then(|w| w.window_handle().downcast::<MultiWorkspace>())
+            {
+                ide::spawn_window_instance(window, cx);
+            }
         });
+
+        // On clean quit, remove our own lockfiles so Claude's /ide doesn't list
+        // a phantom Zed after Zed is gone.
+        cx.on_app_quit(|_cx| {
+            ide::remove_my_lockfiles();
+            async {}
+        })
+        .detach();
 
         let restore_finished = cx.background_spawn(restore_task).shared();
 

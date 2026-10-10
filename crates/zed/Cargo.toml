@@ -128,6 +128,13 @@ gpui_platform = { workspace = true, features = [
     "x11",
 ] }
 gpui_tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time"] }
+async-channel = "2"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+libc.workspace = true
+multi_buffer.workspace = true
+buffer_diff.workspace = true
 hang_telemetry.workspace = true
 image = { workspace = true, optional = true }
 itertools.workspace = true
