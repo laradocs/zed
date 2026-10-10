@@ -455,6 +455,9 @@ async fn open_diff_async(
             b.set_capability(Capability::ReadOnly, cx);
             b
         });
+        // 左栏也上语法高亮:借右栏(new_buffer,带 file path)检测出的语言
+        let language = new_buffer.read(cx).language().cloned();
+        old_buffer.update(cx, |b, cx| b.set_language(language, cx));
         // base = old (left, committed), current = new (right, the file buffer).
         let diff = cx.new(|cx| {
             let mut diff = BufferDiff::new_with_base_text_buffer(
